@@ -17,7 +17,7 @@ const ResumeUpload = () => {
 
         try {
             // Assuming backend is running on port 5000 or production URL
-            const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+            const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/$/, '');
             const response = await fetch(`${API_URL}/api/analyze`, {
                 method: 'POST',
                 body: formData,
