@@ -1,8 +1,29 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const pdf = require('pdf-parse');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const pdf = require('pdf-parse'); // Kept as fall back or just remove if unused
+const { createCanvas } = require('canvas');
+const Tesseract = require('tesseract.js');
+// using pdfjs-dist below
+const Groq = require('groq-sdk');
+
+// Helper: Node Canvas Factory for PDF.js
+function NodeCanvasFactory() { }
+NodeCanvasFactory.prototype = {
+    create: function (width, height) {
+        const canvas = createCanvas(width, height);
+        const context = canvas.getContext("2d");
+        return { canvas, context };
+    },
+    reset: function (canvasAndContext, width, height) {
+        canvasAndContext.canvas.width = width;
+        canvasAndContext.canvas.height = height;
+    },
+    destroy: function (canvasAndContext) {
+        canvasAndContext.canvas = null;
+        canvasAndContext.context = null;
+    },
+};
 require('dotenv').config();
 
 const app = express();
@@ -18,24 +39,22 @@ const upload = multer({
     limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
 });
 
-// Gemini Setup
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'MISSING_API_KEY');
-
-// Initialize active model safely
-global.activeModelName = global.activeModelName || "gemini-2.0-flash";
+// Groq Setup
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // Health Check
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', model: global.activeModelName, mode: 'dynamic' });
+    res.json({ status: 'ok', provider: 'Groq', model: 'llama3-8b-8192' });
 });
 
 app.get('/', (req, res) => {
-    res.send('SmartATS Backend is Running');
+    res.send('SmartATS Backend is Running (Powered by Groq)');
 });
 
 const uploadMiddleware = upload.single('resume');
 
 app.post('/api/analyze', (req, res, next) => {
+    console.log('Request received at /api/analyze'); // Log entry
     uploadMiddleware(req, res, (err) => {
         if (err instanceof multer.MulterError) {
             console.error('Multer Error:', err);
@@ -49,32 +68,80 @@ app.post('/api/analyze', (req, res, next) => {
 }, async (req, res) => {
     try {
         // Validation: Environment Variable
-        if (!process.env.GEMINI_API_KEY) {
-            console.error('SERVER ERROR: GEMINI_API_KEY is missing in .env file');
+        if (!process.env.GROQ_API_KEY) {
+            console.error('SERVER ERROR: GROQ_API_KEY is missing in .env file');
             return res.status(500).json({
                 error: 'Server Misconfiguration',
-                details: 'GEMINI_API_KEY is missing. Please add it to backend/.env'
+                details: 'GROQ_API_KEY is missing. Please add it to backend/.env'
             });
         }
 
         // Validation: File Upload
         if (!req.file) {
+            console.error('Error: No file received in req.file'); // Log missing file
             return res.status(400).json({ error: 'No file uploaded' });
         }
 
         console.log(`Processing file: ${req.file.originalname} (${req.file.size} bytes)`);
 
-        // 1. Extract Text from PDF
+        const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+
+        // ...
+
+        // 1. Extract Text from PDF (using pdfjs-dist)
         let resumeText = '';
         try {
-            console.log('Parsing PDF...');
-            const pdfData = await pdf(req.file.buffer);
-            resumeText = pdfData.text;
-            console.log(`PDF Parsed successfully. Text length: ${resumeText.length}`);
+            console.log('Parsing PDF with pdfjs-dist...');
 
-            if (!resumeText || resumeText.length < 50) {
-                return res.status(400).json({ error: 'Could not extract text from PDF. It might be image-based.' });
+            // Allow pdfjs to process binary data
+            const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(req.file.buffer) });
+            const pdfDocument = await loadingTask.promise;
+
+            let fullText = '';
+            for (let i = 1; i <= pdfDocument.numPages; i++) {
+                const page = await pdfDocument.getPage(i);
+                const textContent = await page.getTextContent();
+                const pageText = textContent.items.map(item => item.str).join(' ');
+                fullText += pageText + '\n';
             }
+
+            resumeText = fullText.trim();
+            console.log(`PDF Parsed successfully. Text length: ${resumeText.length}`);
+            console.log('Sample text:', resumeText.substring(0, 100));
+
+            // Validation: Ensure we actually got text. If not, try OCR.
+            if (!resumeText || resumeText.length < 50) {
+                console.warn(`⚠️ Text Extraction Low/Empty (${resumeText.length}). Attempting OCR (Optical Character Recognition)...`);
+
+                let ocrText = '';
+                const canvasFactory = new NodeCanvasFactory();
+
+                for (let i = 1; i <= pdfDocument.numPages; i++) {
+                    const page = await pdfDocument.getPage(i);
+                    const viewport = page.getViewport({ scale: 1.5 });
+                    const canvasAndContext = canvasFactory.create(viewport.width, viewport.height);
+
+                    await page.render({
+                        canvasContext: canvasAndContext.context,
+                        viewport: viewport,
+                        canvasFactory: canvasFactory
+                    }).promise;
+
+                    const imageBuffer = canvasAndContext.canvas.toBuffer();
+                    const { data: { text } } = await Tesseract.recognize(imageBuffer, 'eng');
+                    ocrText += text + '\n';
+
+                    console.log(`OCR Page ${i} complete. Found ${text.length} chars.`);
+                }
+
+                resumeText = ocrText.trim();
+                console.log(`OCR Complete. Total Text length: ${resumeText.length}`);
+
+                if (!resumeText || resumeText.length < 50) {
+                    throw new Error('OCR failed to extract sufficient text. File might be blank or unclear.');
+                }
+            }
+
         } catch (pdfError) {
             console.error('PDF Parse Error:', pdfError);
             return res.status(500).json({ error: 'Failed to read PDF file.', details: pdfError.message });
@@ -86,8 +153,9 @@ app.post('/api/analyze', (req, res, next) => {
             Return a JSON object ONLY, with no extra text or markdown formatting.
             The JSON structure must be:
             {
-                "score": <number 0-100>,
+                "score": <number 0-100, be strict and realistic, do NOT default to 85>,
                 "grade": "<string Excellent/Good/Needs Improvement>",
+                ...
                 "summary": "<string brief summary of the resume>",
                 "issues": {
                     "critical": <number count of critical issues>,
@@ -114,44 +182,30 @@ app.post('/api/analyze', (req, res, next) => {
             ${resumeText.substring(0, 15000)}
         `;
 
-        // 3. Dynamic Model Selection (Gemini)
-        // Updated based on confirmed available models and checking for quota
-        const CANDIDATE_MODELS = [
-            "gemini-flash-latest",       // Likely 1.5 Flash (Stable)
-            "gemini-2.0-flash-lite",     // Lighter, maybe better quota
-            "gemini-2.0-flash-exp",      // Experimental
-            "gemini-2.5-flash",          // Newest
-            "gemini-2.0-flash",          // (Quota exceeded earlier, keep as backup)
-            "gemini-pro"                 // Fallback
-        ];
-        let result = null;
-        let lastError = null;
+        // 3. Groq Analysis
+        let resultText = '';
+        try {
+            console.log('Attempting analysis with Groq (llama-3.3-70b-versatile)...');
+            const chatCompletion = await groq.chat.completions.create({
+                messages: [{ role: 'user', content: prompt }],
+                model: 'llama-3.3-70b-versatile',
+                temperature: 0.5,
+                max_tokens: 2048,
+                top_p: 1,
+                stream: false
+                // response_format: { type: 'json_object' } // Removed to avoid potential 400/500 errors with Llama 3
+            });
 
-        for (const modelName of CANDIDATE_MODELS) {
-            try {
-                console.log(`Attempting analysis with model: ${modelName}`);
-                const model = genAI.getGenerativeModel({ model: modelName });
-                result = await model.generateContent(prompt);
+            resultText = chatCompletion.choices[0]?.message?.content || '';
+            console.log('✅ Success with Groq');
 
-                console.log(`✅ Success with model: ${modelName}`);
-                global.activeModelName = modelName;
-                break;
-            } catch (e) {
-                console.warn(`⚠️ Model ${modelName} failed: ${e.message}`);
-                lastError = e;
-            }
+        } catch (groqError) {
+            console.error('Groq API Error:', groqError);
+            throw new Error(`Groq Analysis Failed: ${groqError.message}`);
         }
-
-        if (!result) {
-            console.error("All models failed.");
-            throw lastError || new Error("All available Gemini models failed.");
-        }
-
-        const response = await result.response;
-        const text = response.text();
 
         // Clean up response
-        const jsonStr = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        const jsonStr = resultText.replace(/```json/g, '').replace(/```/g, '').trim();
 
         try {
             const analysisData = JSON.parse(jsonStr);

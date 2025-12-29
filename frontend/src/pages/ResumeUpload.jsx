@@ -24,8 +24,8 @@ const ResumeUpload = () => {
             });
 
             if (!response.ok) {
-                throw new Error('Analysis failed. Please try again.');
-                // In a real scenario, read the error message from response
+                const errorData = await response.json();
+                throw new Error(errorData.error || errorData.details || 'Analysis failed. Please try again.');
             }
 
             const data = await response.json();
